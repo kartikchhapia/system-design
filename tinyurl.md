@@ -113,15 +113,36 @@ Top 1% of links receive ~80% of all traffic (power law)
   without ever touching the database.
 ```
 
+### Server Count Estimation
+
+```
+Redirect Service servers:
+  1 server handles ~10,000 redirects/sec (mostly cache lookups + HTTP)
+  Peak: 1,160,000/sec  →  116 servers
+  After CDN absorbs 75%: 290,000/sec hit origin  →  ~30 servers
+
+Write Service servers:
+  1 server handles ~1,000 creates/sec (DB write + Redis write)
+  Peak: 6,000/sec  →  ~6 servers
+
+Redis nodes:
+  Hot set: 500 MB. Standard node: 64 GB
+  →  1 node covers everything, use 3 for redundancy (primary + 2 replicas)
+
+Database nodes:
+  100 TB over 5 years, ~5 TB per node
+  →  ~9 nodes (3 per availability zone for fault tolerance)
+```
+
 ### The 5 Numbers That Drive Every Design Decision
 
 | Number | Value | Design decision forced |
 |---|---|---|
 | Peak redirects | 1,160,000/sec | CDN + multi-layer cache is mandatory |
-| Hot set size | 500 MB | Cache the hot set in Redis; >95% hit rate is achievable |
-| DB reads after cache | ~5,800/sec | Database read replicas can easily handle this |
-| 5-year storage | ~100 TB | Must shard the database across multiple servers |
-| Code space (62^7) | 3.5 trillion | Won't run out of codes for decades |
+| Hot set size | 500 MB | Single Redis cluster covers everything; >95% hit rate |
+| DB reads after cache | ~5,800/sec | Read replicas handle this comfortably |
+| 5-year storage | ~100 TB | Must shard across ~9 DB nodes |
+| Server count at peak | ~30 redirect + 6 write | Stateless services; scale horizontally |
 
 ---
 
@@ -160,80 +181,121 @@ Now 95% of redirects are served from Redis (memory, ~1ms) instead of the databas
 
 ### Production Architecture
 
+> **Shape key:**
+> `┌──────┐` regular box = application service &nbsp;|&nbsp;
+> `╔══════╗` double box = database (persistent storage) &nbsp;|&nbsp;
+> `╭──────╮` rounded box = cache (in-memory) &nbsp;|&nbsp;
+> `▷▷────▷▷` = message queue
+
 ```
-                      ┌─────────────────────┐
-                      │   GeoDNS            │  Routes users to
-                      │   (Cloudflare)      │  nearest datacenter
-                      └──────────┬──────────┘
-                                 │
-              ┌──────────────────┼─────────────────────┐
-              │                  │                     │
-        US-EAST             EU-WEST                  APAC
-              │
-              ▼
-┌────────────────────────────────────────────────────────────┐
-│                                                            │
-│  [1] CDN Edge Cache  ──────────────────────────────────── │
-│       Cloudflare PoP (200+ worldwide)                      │
-│       Serves ~75% of redirects with no server involved     │
-│                                                            │
-│  [2] Load Balancer                                         │
-│       Distributes remaining traffic across app servers     │
-│                                                            │
-│  ┌──────────────────┐    ┌──────────────────┐            │
-│  │ [3] Redirect Svc │    │ [4] Write Svc    │            │
-│  │  (20 servers)    │    │  (5 servers)     │            │
-│  │  Reads only      │    │  Creates links   │            │
-│  └────────┬─────────┘    └────────┬─────────┘            │
-│           │                       │                       │
-│  [5] Redis Cache                  │                       │
-│      Fast in-memory store         │                       │
-│      Holds the 500MB hot set      │                       │
-│           │ (cache miss)          │ (writes)              │
-│           └───────────┬───────────┘                       │
-│                       │                                   │
-│  [6] Database Cluster (CockroachDB)                       │
-│      Sharded across 9 servers                             │
-│      Stores all 100TB of link data                        │
-│                       │                                   │
-│  [7] Kafka Message Queue                                  │
-│      Receives click events from Redirect Svc              │
-│      Feeds analytics pipeline (never blocks redirects)    │
-│                       │                                   │
-│  [8] ClickHouse (Analytics DB)                            │
-│      Stores click counts, countries, referrers            │
-│                                                           │
-└────────────────────────────────────────────────────────────┘
+                       ┌─────────────────────┐
+                       │      Browser        │  CLIENT
+                       └──────────┬──────────┘
+                                  │ HTTPS
+                                  ▼
+          ┌───────────────────────────────────────────────────┐
+          │         Cloudflare CDN  (200+ global PoPs)        │  EDGE
+          │         Caches 302 responses · s-maxage=3600       │
+          └───────────────────────┬───────────────────────────┘
+                                  │ ~25% cache miss
+                                  ▼
+     ┌──────────────────┐    ┌──────────────────────────────────┐
+     │  Load Balancer   │───▶│  API Gateway                     │  GATEWAY
+     │   (L7 / ALB)     │    │  Auth · Rate Limit · WAF         │
+     └──────────────────┘    └──────────────────────────────────┘
+           │ GET /{code}                   │ POST /api/v1/urls
+           ▼                               ▼
+  ┌─────────────────────┐       ┌──────────────────────────┐
+  │   Redirect Service  │       │      Write Service        │  SERVICE
+  │   ~30 pods          │       │      ~6 pods              │
+  │   L2 LRU (10K/pod)  │       │   Key pool: 1K codes      │
+  └──────────┬──────────┘       └─────────────┬─────────────┘
+             │                                │
+             ▼                                │
+  ╭─────────────────────╮                     │
+  │    Redis Cluster    │                     │  CACHE
+  │    6 shards         │                     │
+  │    ~500 MB hot set  │                     │
+  │    TTL: 1 hr / key  │                     │
+  ╰──────────┬──────────╯                     │
+             │ ~1% miss                       │
+             ▼                                ▼
+  ╔══════════════════════╗    ╔═══════════════════════════╗
+  ║   url_mappings       ║    ║   key_pool                ║  STORAGE
+  ║   CockroachDB        ║    ║   CockroachDB             ║
+  ║   9 nodes · 3 AZs    ║    ║   Pre-generated codes     ║
+  ║   ~100 TB / 5 yrs    ║    ║   SKIP LOCKED claim       ║
+  ╚══════════════════════╝    ╚═══════════════════════════╝
+             │
+             │ click event  (async — never blocks the 302 response)
+             ▼
+  ▷▷── Kafka  (url.clicks · 256 partitions · RF=3) ──▷▷      ASYNC
+             │
+             ▼
+  ┌──────────────────────┐
+  │  Analytics Consumer  │
+  └──────────┬───────────┘
+             │
+             ▼
+  ╔══════════════════════╗
+  ║   ClickHouse         ║
+  ║   Columnar · monthly ║
+  ║   Hourly aggregates  ║
+  ╚══════════════════════╝
 ```
 
-**Component legend:**
+**What each layer does:**
 
-| # | Component | What it does | Why it exists |
-|---|---|---|---|
-| 1 | CDN Edge | Caches redirects at 200+ global locations | Serves 75% of traffic with <5ms latency, no origin hit |
-| 2 | Load Balancer | Spreads traffic across servers | No single server is overwhelmed |
-| 3 | Redirect Service | Handles GET `/{code}` requests | Read-only, can scale independently from writes |
-| 4 | Write Service | Handles POST `/api/v1/urls` | Write path isolated — its failure doesn't affect redirects |
-| 5 | Redis Cache | In-memory key-value store | Serves hot URLs in ~1ms vs ~15ms from database |
-| 6 | Database | Permanent storage for all links | Source of truth; only hit on cache misses |
-| 7 | Kafka | Message queue for click events | Decouples analytics from the redirect path |
-| 8 | ClickHouse | Analytics database | Optimized for counting and aggregating billions of events |
+| Layer | Components | Responsibility |
+|---|---|---|
+| Edge | CDN | Serves 75% of redirects globally in <5ms — no origin hit |
+| Gateway | Load Balancer + API Gateway | Distributes load; enforces auth and rate limits at the boundary |
+| Service | Redirect Svc + Write Svc | Separated so a write outage never takes down redirects |
+| Cache | Redis Cluster (rounded box) | Serves hot links in ~1ms; eliminates 99% of DB reads |
+| Storage | CockroachDB (double box) | Source of truth; only reached on genuine cache misses |
+| Async | Kafka + ClickHouse | Click analytics is fully decoupled — never blocks a redirect |
 
 ---
 
-### The Redirect Request: Step by Step
+### Read Path — How a Redirect Works
 
-When someone clicks `https://tiny.url/xK3p9Qa`:
+```
+Browser → CDN → Load Balancer → Redirect Service → Redis → Database
+                    ↑
+              (only ~25% reach here; CDN handles the rest)
+```
 
-1. Browser asks DNS: "where is tiny.url?" → **GeoDNS** returns the nearest Cloudflare PoP
-2. **CDN checks its cache** — if this code was recently clicked, it returns the redirect immediately (~5ms). Done for ~75% of requests.
-3. CDN miss → request reaches the **Load Balancer** → routed to a **Redirect Service** server
-4. Redirect Service checks its **local in-memory cache** (top 10,000 hottest links per server). Hit → return redirect (~2ms)
-5. Not in local cache → Redirect Service queries **Redis**. Hit → return redirect, populate local cache (~3ms)
-6. Not in Redis → Redirect Service queries the **Database** read replica. Always a hit (or 404). Return redirect, populate Redis (~15ms)
-7. **In parallel (never blocking the redirect):** a click event is published to Kafka → Analytics Service counts it in ClickHouse
+Step by step:
 
-**Key insight: the database is only involved in ~1% of redirects.** The other 99% are served from CDN, local memory, or Redis.
+| Step | Where | What happens | Latency | % of traffic |
+|---|---|---|---|---|
+| 1 | CDN Edge | Cache hit → return 302 immediately | ~5ms | 75% — done here |
+| 2 | Redirect Svc (L2) | Pod's local memory hit → return 302 | ~2ms | ~4% of remaining |
+| 3 | Redis | Cache hit → return 302, warm L2 | ~3ms | ~20% of remaining |
+| 4 | Database | Read replica lookup → return 302, warm Redis | ~15ms | ~1% of remaining |
+| 5 | Kafka (parallel) | Click event published — never blocks step 1–4 | async | 100% |
+
+**The database is involved in less than 1% of all redirects.**
+
+---
+
+### Write Path — How a Link Gets Created
+
+```
+Browser → API Gateway → Write Service → Database
+                              ↓               ↓
+                           Redis          Kafka → (cross-region cache warm)
+```
+
+Step by step:
+
+1. **API Gateway** checks JWT auth and rate limit (reject here if over limit)
+2. **Write Service** checks `Idempotency-Key` in Redis — if seen before, return cached response
+3. Write Service pops a pre-fetched short code from its local buffer (no DB call)
+4. **Database transaction**: INSERT into `url_mappings` + INSERT into `idempotency_log` (atomic)
+5. Write response to Redis (so the new link is immediately cacheable on first click)
+6. Publish to Kafka `url.created` → other regions warm their caches async
+7. Return 201 to client
 
 ---
 
