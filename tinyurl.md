@@ -152,117 +152,115 @@ Database nodes:
 
 The simplest design that works:
 
-```
-User → Web Server → Database
+```mermaid
+flowchart LR
+    Browser([Browser]) -->|POST long_url / GET short_code| Server[Web Server]
+    Server -->|SELECT / INSERT| DB[(PostgreSQL)]
 ```
 
-1. User POSTs a long URL
-2. Server generates a short code, saves it in the DB
-3. User GETs `/xK3p9Qa` → server looks up DB → redirects
+1. User POSTs a long URL → server generates a code, saves to DB, returns short URL
+2. User GETs `/xK3p9Qa` → server looks up DB → redirects
 
-**This breaks at ~5,000 redirects/second** because the database can't keep up.
+**This breaks at ~5,000 redirects/second** because the database can't keep up with every single lookup.
 
 ---
 
 ### Add Caching: First Fix
 
-```
-User → Web Server → Redis Cache → Database
-                      ↑
-                 Stores hot links
-                 in fast memory
+```mermaid
+flowchart LR
+    Browser([Browser]) --> Server[Web Server]
+    Server -->|check first| Cache([Redis])
+    Cache -->|miss ~5%| DB[(PostgreSQL)]
 ```
 
-Now 95% of redirects are served from Redis (memory, ~1ms) instead of the database (~10–20ms). Database load drops 20x.
+Now 95% of redirects are answered by Redis (~1ms) instead of the database (~15ms). Database load drops 20x.
 
-**This breaks at ~100,000 redirects/second** because a single Redis node and single web server are both limits.
+**This breaks at ~100,000 redirects/second** — a single web server and single Redis node are now the limits.
 
 ---
 
 ### Production Architecture
 
-> **Shape key:**
-> `┌──────┐` regular box = application service &nbsp;|&nbsp;
-> `╔══════╗` double box = database (persistent storage) &nbsp;|&nbsp;
-> `╭──────╮` rounded box = cache (in-memory) &nbsp;|&nbsp;
-> `▷▷────▷▷` = message queue
+```mermaid
+flowchart TD
+    Browser([Browser])
 
-```
-                       ┌─────────────────────┐
-                       │      Browser        │  CLIENT
-                       └──────────┬──────────┘
-                                  │ HTTPS
-                                  ▼
-          ┌───────────────────────────────────────────────────┐
-          │         Cloudflare CDN  (200+ global PoPs)        │  EDGE
-          │         Caches 302 responses · s-maxage=3600       │
-          └───────────────────────┬───────────────────────────┘
-                                  │ ~25% cache miss
-                                  ▼
-     ┌──────────────────┐    ┌──────────────────────────────────┐
-     │  Load Balancer   │───▶│  API Gateway                     │  GATEWAY
-     │   (L7 / ALB)     │    │  Auth · Rate Limit · WAF         │
-     └──────────────────┘    └──────────────────────────────────┘
-           │ GET /{code}                   │ POST /api/v1/urls
-           ▼                               ▼
-  ┌─────────────────────┐       ┌──────────────────────────┐
-  │   Redirect Service  │       │      Write Service        │  SERVICE
-  │   ~30 pods          │       │      ~6 pods              │
-  │   L2 LRU (10K/pod)  │       │   Key pool: 1K codes      │
-  └──────────┬──────────┘       └─────────────┬─────────────┘
-             │                                │
-             ▼                                │
-  ╭─────────────────────╮                     │
-  │    Redis Cluster    │                     │  CACHE
-  │    6 shards         │                     │
-  │    ~500 MB hot set  │                     │
-  │    TTL: 1 hr / key  │                     │
-  ╰──────────┬──────────╯                     │
-             │ ~1% miss                       │
-             ▼                                ▼
-  ╔══════════════════════╗    ╔═══════════════════════════╗
-  ║   url_mappings       ║    ║   key_pool                ║  STORAGE
-  ║   CockroachDB        ║    ║   CockroachDB             ║
-  ║   9 nodes · 3 AZs    ║    ║   Pre-generated codes     ║
-  ║   ~100 TB / 5 yrs    ║    ║   SKIP LOCKED claim       ║
-  ╚══════════════════════╝    ╚═══════════════════════════╝
-             │
-             │ click event  (async — never blocks the 302 response)
-             ▼
-  ▷▷── Kafka  (url.clicks · 256 partitions · RF=3) ──▷▷      ASYNC
-             │
-             ▼
-  ┌──────────────────────┐
-  │  Analytics Consumer  │
-  └──────────┬───────────┘
-             │
-             ▼
-  ╔══════════════════════╗
-  ║   ClickHouse         ║
-  ║   Columnar · monthly ║
-  ║   Hourly aggregates  ║
-  ╚══════════════════════╝
+    subgraph EDGE
+        CDN[Cloudflare CDN\n200+ PoPs · serves ~75% of all redirects]
+    end
+
+    subgraph GATEWAY
+        LB[Load Balancer]
+        GW[API Gateway\nAuth · Rate Limit · WAF]
+        LB --> GW
+    end
+
+    subgraph SERVICE
+        RS[Redirect Service\n~30 pods · L2 LRU cache per pod]
+        WS[Write Service\n~6 pods · 1K key pool buffer]
+    end
+
+    subgraph CACHE
+        Redis([Redis Cluster\n6 shards · 500 MB hot set · TTL 1hr])
+    end
+
+    subgraph STORAGE
+        DB[(CockroachDB — url_mappings\n9 nodes · 3 AZs · ~100 TB)]
+        KP[(CockroachDB — key_pool\npre-generated short codes)]
+    end
+
+    subgraph ASYNC
+        Kafka[/Kafka\nurl.clicks · 256 partitions · RF=3/]
+        CH[(ClickHouse\nColumnar analytics · partitioned by month)]
+    end
+
+    Browser -->|HTTPS| CDN
+    CDN -->|"~25% cache miss"| LB
+    GW -->|"GET /{code}"| RS
+    GW -->|POST /api/v1/urls| WS
+    RS --> Redis
+    Redis -->|"~1% miss"| DB
+    WS --> DB
+    WS --> KP
+    RS -.->|"async — never blocks redirect"| Kafka
+    Kafka --> CH
+
+    classDef service fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    classDef db      fill:#fef3c7,stroke:#d97706,color:#713f12
+    classDef cache   fill:#d1fae5,stroke:#059669,color:#064e3b
+    classDef queue   fill:#fce7f3,stroke:#db2777,color:#831843
+    classDef edge    fill:#f3f4f6,stroke:#6b7280,color:#1f2937
+
+    class RS,WS,LB,GW service
+    class DB,KP,CH db
+    class Redis cache
+    class Kafka queue
+    class CDN edge
 ```
 
 **What each layer does:**
 
-| Layer | Components | Responsibility |
-|---|---|---|
-| Edge | CDN | Serves 75% of redirects globally in <5ms — no origin hit |
-| Gateway | Load Balancer + API Gateway | Distributes load; enforces auth and rate limits at the boundary |
-| Service | Redirect Svc + Write Svc | Separated so a write outage never takes down redirects |
-| Cache | Redis Cluster (rounded box) | Serves hot links in ~1ms; eliminates 99% of DB reads |
-| Storage | CockroachDB (double box) | Source of truth; only reached on genuine cache misses |
-| Async | Kafka + ClickHouse | Click analytics is fully decoupled — never blocks a redirect |
+| Layer | Shape colour | Components | Responsibility |
+|---|---|---|---|
+| Edge | grey | CDN | Serves 75% of redirects globally in <5ms — no origin hit |
+| Gateway | blue | Load Balancer + API Gateway | Distributes load; enforces auth and rate limits |
+| Service | blue | Redirect Svc + Write Svc | Separated so a write outage never affects redirects |
+| Cache | green | Redis Cluster (stadium shape) | Serves hot links in ~1ms; eliminates 99% of DB reads |
+| Storage | yellow | CockroachDB (cylinder shape) | Source of truth; only hit on genuine cache misses |
+| Async | pink | Kafka + ClickHouse | Click analytics fully decoupled — never blocks a redirect |
 
 ---
 
 ### Read Path — How a Redirect Works
 
-```
-Browser → CDN → Load Balancer → Redirect Service → Redis → Database
-                    ↑
-              (only ~25% reach here; CDN handles the rest)
+```mermaid
+flowchart LR
+    Browser([Browser]) --> CDN[CDN\n75% served here]
+    CDN -->|25% miss| RS[Redirect Service\nL2 cache per pod]
+    RS -->|L2 miss| Redis([Redis])
+    Redis -->|1% miss| DB[(CockroachDB\nread replica)]
+    RS -.->|async| Kafka[/Kafka/]
 ```
 
 Step by step:
@@ -281,10 +279,13 @@ Step by step:
 
 ### Write Path — How a Link Gets Created
 
-```
-Browser → API Gateway → Write Service → Database
-                              ↓               ↓
-                           Redis          Kafka → (cross-region cache warm)
+```mermaid
+flowchart LR
+    Browser([Browser]) -->|POST /api/v1/urls| GW[API Gateway\nAuth · Rate Limit]
+    GW --> WS[Write Service\nkey pool buffer]
+    WS -->|INSERT url_mappings| DB[(CockroachDB)]
+    WS -->|SET cache| Redis([Redis])
+    WS -.->|async warm other regions| Kafka[/Kafka/]
 ```
 
 Step by step:
