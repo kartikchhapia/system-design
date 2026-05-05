@@ -626,6 +626,127 @@ Even worst case: 2 writes/sec per video × 500M videos active simultaneously
 
 ---
 
+#### The remaining hot write problem: Kafka partition saturation
+
+Cassandra and Redis are solved. But look at what Kafka partitioning by `video_id` actually means for a viral video:
+
+```
+580,000 view events/sec for one video_id
+All land on ONE Kafka partition (partitioned by video_id)
+
+One Kafka partition throughput limit: ~100 MB/sec
+580,000 events × 100 bytes = 58 MB/sec on ONE partition
+
+One viral video = 58% of one partition's throughput
+Two simultaneous viral videos on the same partition = over the limit
+```
+
+This is a real problem. Kafka partitions are the unit of parallelism — you cannot have two consumers read the same partition simultaneously. If one partition is saturated, all 580K events/sec must queue behind it.
+
+**Why doesn't "just add more partitions" fix this?**
+
+Partitioning by `video_id` means a given video always maps to the same partition (`hash(video_id) % num_partitions`). Adding more partitions reshuffles assignments, but one video's events still land on one partition. The viral video doesn't spread across partitions.
+
+**The fix: partition by `(video_id, bucket)` for high-volume videos**
+
+When a video crosses a throughput threshold (detected by the View Event Service monitoring its own publish rate), switch to a multi-partition fan-out:
+
+```python
+def get_kafka_partition(video_id, event_ts):
+    # For normal videos: one partition per video (ordered, simple)
+    if not is_hot_video(video_id):
+        return hash(video_id) % NUM_PARTITIONS
+
+    # For hot videos: spread across N sub-partitions
+    # bucket rotates every second so events are evenly distributed
+    NUM_HOT_BUCKETS = 8
+    bucket = event_ts % NUM_HOT_BUCKETS
+    return hash(f"{video_id}:{bucket}") % NUM_PARTITIONS
+```
+
+Now 580K events/sec spread across 8 Kafka partitions = 72.5K events/sec × 100 bytes = 7.25 MB/sec per partition — well within the limit.
+
+**But now one Flink task no longer sees all events for one video.** Eight Flink tasks each see 1/8 of the events. Each produces a partial delta. How do Flink workers combine these?
+
+**Option 1 — Two-phase aggregation:**
+
+```
+Phase 1 (per sub-partition, 8 workers):
+  Each Flink task aggregates its 1/8 slice → partial delta
+
+Phase 2 (one reducer per video):
+  A second Flink operator receives all 8 partial deltas
+  Sums them → final delta for the video
+  Writes to Redis + Cassandra once
+```
+
+This is the standard "map-reduce in a stream" pattern. Flink supports it natively via keyed streams:
+
+```python
+# Phase 1: aggregate per sub-partition
+partial_deltas = (
+    kafka_source
+    .key_by(lambda e: f"{e.video_id}:{e.bucket}")  # 8 tasks per video
+    .window(TumblingEventTimeWindows.of(seconds(1)))
+    .sum("count")
+)
+
+# Phase 2: combine all sub-partitions for a video
+final_deltas = (
+    partial_deltas
+    .key_by(lambda d: d.video_id)   # 1 task per video
+    .window(TumblingEventTimeWindows.of(seconds(1)))
+    .sum("delta")
+)
+# final_deltas now has exactly 1 output per video per second
+# → 1 Redis INCRBY/sec and 1 Cassandra write/sec — unchanged
+```
+
+**Option 2 — Accept eventual consistency within the window:**
+
+All 8 Flink tasks write their partial deltas directly to Redis/Cassandra. Redis `INCRBY` is atomic — 8 partial increments in 1 second still produce the correct total:
+
+```
+Flink task 1: INCRBY views:dQw4w9WgXcQ 72500  (1/8 of events)
+Flink task 2: INCRBY views:dQw4w9WgXcQ 72300
+...
+Flink task 8: INCRBY views:dQw4w9WgXcQ 72800
+
+Redis total: 580,000 — correct, via 8 atomic increments instead of 1
+Cassandra: same — 8 COUNTER increments/sec on one partition (trivial)
+```
+
+This is simpler but produces 8 SSE push events per second instead of 1 — the SSE fan-out service deduplicates by throttling to one push per second per video.
+
+**Which approach to use?**
+
+Option 2 is simpler and correct because `INCRBY` (Redis) and Cassandra COUNTER are both atomic and commutative. Use Option 2 by default. Use Option 1 only if you need SSE to push exactly one update per window (strict 1-second cadence required).
+
+**Hot partition detection:**
+
+```python
+# In View Event Service — track publish rate per video_id
+# If this video crosses 50K events/sec (50% of partition limit),
+# switch to multi-bucket partitioning
+if events_per_sec[video_id] > 50_000:
+    mark_as_hot(video_id, ttl=300)  # hot for 5 minutes
+```
+
+---
+
+**Complete hot write analysis — all layers:**
+
+| Layer | Hot write risk | Rate for viral video | Limit | Handled? |
+|---|---|---|---|---|
+| View Event Service → Kafka | Kafka partition saturation | 58 MB/sec on 1 partition | ~100 MB/sec | ✅ Multi-bucket partitioning |
+| Flink task | CPU saturation per task | 580K events/sec on 1 task | ~5M events/sec (simple counting) | ✅ Not a bottleneck |
+| Redis `INCRBY` | Hot key on one Redis shard | 1–8 ops/sec (after windowing) | ~500K ops/sec per shard | ✅ Not a bottleneck |
+| Cassandra COUNTER | Hot row write | 1–8 writes/sec | ~50K writes/sec per node | ✅ Not a bottleneck |
+
+The only layer that requires explicit mitigation is the Kafka partition — and the fix (multi-bucket for hot videos) keeps every other layer unchanged.
+
+---
+
 **Why this eliminates both previous problems:**
 
 | Problem | Option A | Option B | Option C |
