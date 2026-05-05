@@ -572,6 +572,60 @@ for (video_id, delta) in window_results:
     })
 ```
 
+---
+
+#### Wait — if the video goes viral, aren't we still hammering the same Cassandra partition?
+
+This is the most common follow-up question for Option C. Let's work through it explicitly.
+
+A viral video gets 500,000 views/sec. Kafka partitions by `video_id` — all events for `dQw4w9WgXcQ` land on one Kafka partition, processed by one Flink task. That one Flink task produces one delta per 1-second window:
+
+```
+580,000 individual view events per second
+       │
+       ▼
+One Flink task (for this partition)
+  Window [10:00:00 – 10:00:01]: receives all 580K events
+  Emits: { video_id: "dQw4w9WgXcQ", delta: 580000 }
+       │
+       ▼
+One write to Cassandra per second:
+  UPDATE video_counts SET total_views = total_views + 580000
+  WHERE video_id = 'dQw4w9WgXcQ'
+```
+
+**One write per second to one Cassandra partition — regardless of how viral the video is.**
+
+Cassandra handles 50,000 writes/sec per node. One write/sec is 0.002% of one node's capacity. No hot partition, no bottleneck.
+
+**But wait — 30 Flink workers across 30 Kafka partitions, all writing to the same Cassandra partition key?**
+
+No. Kafka is partitioned by `video_id`. All events for `dQw4w9WgXcQ` go to exactly one Kafka partition, processed by exactly one Flink worker. That one worker emits one delta per second. Only one Flink worker ever writes to `video_id = 'dQw4w9WgXcQ'` at a time.
+
+**Why Cassandra's COUNTER type is still important:**
+
+Even though only one Flink worker writes to each video's partition normally, consider:
+- Flink restarts and two instances briefly overlap during rebalancing
+- Network retries cause the same delta to be submitted twice
+- A new Flink deployment causes a brief handoff period
+
+In all these cases, Cassandra's `COUNTER` column uses **CRDT (Conflict-free Replicated Data Type) semantics**: the counter can only be incremented (never overwritten), and concurrent increments from multiple nodes always converge to the correct total. Even if two Flink workers briefly write to the same partition simultaneously, both increments are applied — no data is lost, no lock is needed.
+
+```
+Normal operation:    1 Flink worker × 1 write/sec → 1 Cassandra write/sec per video
+Rebalancing period:  2 Flink workers × 1 write/sec → 2 Cassandra writes/sec (brief)
+Cassandra capacity:  50,000 writes/sec per node
+
+Even worst case: 2 writes/sec per video × 500M videos active simultaneously
+= 1,000,000,000 writes/sec → clearly not happening
+= At peak, maybe 10M actively-counted videos × 1 write/sec = 10M writes/sec
+→ Across 3 Cassandra nodes = ~3.3M writes/sec per node → within capacity
+```
+
+**The key principle to state in an interview:** Flink windowing doesn't just reduce Redis pressure — it decouples the Cassandra write rate from the view event rate. A video getting 1M views/sec produces exactly the same Cassandra write rate (1 write/sec) as a video getting 10 views/sec. The fanout problem is solved entirely at the Kafka→Flink boundary.
+
+---
+
 **Why this eliminates both previous problems:**
 
 | Problem | Option A | Option B | Option C |
