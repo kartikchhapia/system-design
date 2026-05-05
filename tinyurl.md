@@ -370,12 +370,59 @@ The fix: the client sends a unique `Idempotency-Key` header with every create re
 | `redirect_type` | SMALLINT | 301 or 302 |
 | `metadata` | JSON | Tags, campaign name, etc. |
 
+### Supporting table: `key_pool`
+
+| Column | Type | Notes |
+|---|---|---|
+| `short_code` | CHAR(7) | Pre-generated code, not yet assigned to any URL |
+| `created_at` | TIMESTAMP | When this code was generated (for pool age monitoring) |
+
+### Supporting table: `idempotency_log`
+
+| Column | Type | Notes |
+|---|---|---|
+| `idempotency_key` | VARCHAR(64) | The client-supplied unique request ID |
+| `short_code` | CHAR(7) | The code that was assigned for this request |
+| `response_body` | TEXT | The exact JSON response returned — replayed on duplicate |
+| `created_at` | TIMESTAMP | TTL: rows expire after 24 hours |
+
+---
+
+### SQL vs NoSQL — why not the obvious choices?
+
+Before explaining what we chose, here's why the obvious alternatives don't fit:
+
+| Database | Type | Why it seems attractive | Why it doesn't fit |
+|---|---|---|---|
+| **DynamoDB** | Key-value / document | Massive scale, managed, fast key lookups | No support for `SELECT ... FOR UPDATE SKIP LOCKED` (key pool requires row-level locking); cross-item transactions are cumbersome; expensive at 100TB |
+| **Cassandra** | Wide-column | Designed for high write throughput, multi-region | Eventual consistency only — can't enforce unique `short_code` across nodes; no transactions; collision risk is real |
+| **MongoDB** | Document | Flexible schema, easy to operate | No row-level locking for the key pool pattern; multi-document transactions have significant overhead; not designed for 1M point-reads/sec |
+| **Plain PostgreSQL** | Relational | Familiar SQL, strong consistency, great for the key pool pattern | Single-node by default: hits its ceiling at ~5TB on one machine. Horizontal sharding requires a proxy layer (Citus/pgBouncer) that adds operational complexity. Manual replication setup for multi-AZ. |
+| **MySQL + Vitess** | Relational + sharding | Proven at YouTube/Slack scale | Vitess adds significant operational complexity; `FOR UPDATE SKIP LOCKED` behaviour across shards needs careful setup |
+| **CockroachDB** | Distributed SQL | ✅ chosen — see below | — |
+
 ### Database choice: CockroachDB
 
-CockroachDB is PostgreSQL-compatible (familiar SQL) but built for distributed scale. It automatically splits data across many servers and replicates it for reliability. We chose it because:
-- We need PostgreSQL-style SQL and strong consistency for the unique short_code constraint
-- We need to scale to 100TB across multiple servers without manual sharding
-- It handles multiple geographic regions natively
+**Why CockroachDB specifically:**
+
+CockroachDB is PostgreSQL-compatible SQL on the outside, but a distributed key-value store on the inside. Three properties make it the right fit here:
+
+1. **Automatic sharding with no application-level proxy.** CockroachDB splits tables into "ranges" (16MB chunks) and distributes them across nodes automatically. The application talks to any node; routing is internal. With plain PostgreSQL + Citus, your application must be aware of which shard to talk to.
+
+2. **Raft consensus per range, not per cluster.** Each range has its own Raft group — a small committee of 3 nodes that vote on every write. A write is committed only when 2 of 3 agree (quorum). This means:
+   - No single node can corrupt data — it needs agreement
+   - If one node dies, the remaining 2 still have quorum and keep serving writes
+   - A 3-node cluster across 3 availability zones means a full AZ outage still leaves 2 nodes in quorum
+
+3. **REGIONAL BY ROW for geo-distribution.** CockroachDB can pin each row to a specific region based on a column. A UK user's links are stored and served from EU nodes; US user's links from US nodes. Redirect latency drops from ~80ms (cross-Atlantic DB call) to ~8ms (same-region call). Plain PostgreSQL has no concept of this.
+
+```
+   Raft consensus example — 3 nodes, 1 AZ down:
+
+   AZ-1 [Node A] ──┐
+   AZ-2 [Node B] ──┼── Quorum (2/3 agree) → write committed ✅
+   AZ-3 [Node C] ✗ (down)
+```
 
 ### Sharding key: `short_code`
 
@@ -412,22 +459,154 @@ Generate millions of random codes offline (background job, no rush). Store them 
 - Claiming a code from the pool is a simple database delete — fast and reliable
 - No single bottleneck: each Write Service server pre-fetches 1,000 codes from the pool into local memory at startup, eliminating database calls on the hot path
 
-#### The exact mechanism
+#### The exact mechanism — key pool claim
 
 ```sql
--- Claim one code atomically from the pool
--- FOR UPDATE SKIP LOCKED: if two servers run this simultaneously,
--- they each get a DIFFERENT code — no waiting, no contention
+-- Claim 1,000 codes at once during server startup (or refill)
+-- FOR UPDATE SKIP LOCKED is the key: if two servers run this
+-- simultaneously, Postgres/CockroachDB hands them DIFFERENT rows —
+-- no waiting, no duplicate claims, no contention
 DELETE FROM key_pool
-WHERE short_code = (
+WHERE short_code IN (
   SELECT short_code FROM key_pool
-  LIMIT 1
+  LIMIT 1000
   FOR UPDATE SKIP LOCKED
 )
 RETURNING short_code;
 ```
 
-Each Write Service server runs this once to grab 1,000 codes into memory. It refills asynchronously when the local buffer drops below 100. In normal operation, link creation never touches the key pool database at all.
+Each Write Service pod runs this query **once at startup** and holds 1,000 codes in local memory. When its local buffer drops below 100, it refills asynchronously in a background thread. In normal operation, link creation never touches `key_pool` at all — the pod just pops from its in-memory list.
+
+**Monitoring:** Alert when pool size < 1,000,000 codes. Background generator runs continuously as a separate cron job:
+
+```sql
+-- Key generator job (runs every minute):
+INSERT INTO key_pool (short_code, created_at)
+SELECT
+  -- generate random Base62 strings (a-z, A-Z, 0-9)
+  substr(md5(random()::text), 1, 7),
+  NOW()
+FROM generate_series(1, 100000)   -- 100K codes per batch
+ON CONFLICT DO NOTHING;            -- silently skip any accidental duplicate
+```
+
+---
+
+#### End-to-end: what happens when a user creates a link
+
+Here is the exact sequence from HTTP request to database row, with every step shown:
+
+```
+Client                   Write Service             CockroachDB           Redis
+  │                           │                        │                    │
+  │  POST /api/v1/urls        │                        │                    │
+  │  Idempotency-Key: abc123  │                        │                    │
+  │──────────────────────────>│                        │                    │
+  │                           │                        │                    │
+  │                           │ GET idempotency:abc123 │                    │
+  │                           │────────────────────────────────────────────>│
+  │                           │ (nil — first time)     │                    │
+  │                           │<────────────────────────────────────────────│
+  │                           │                        │                    │
+  │                           │ pop 'xK3p9Qa'          │                    │
+  │                           │ from local buffer      │                    │
+  │                           │                        │                    │
+  │                           │  BEGIN TRANSACTION     │                    │
+  │                           │───────────────────────>│                    │
+  │                           │                        │                    │
+  │                           │  INSERT url_mappings   │                    │
+  │                           │  (short_code, long_url,│                    │
+  │                           │   user_id, expires_at) │                    │
+  │                           │───────────────────────>│                    │
+  │                           │                        │                    │
+  │                           │  INSERT idempotency_log│                    │
+  │                           │  (abc123, xK3p9Qa,     │                    │
+  │                           │   response_json)       │                    │
+  │                           │───────────────────────>│                    │
+  │                           │                        │                    │
+  │                           │  COMMIT                │                    │
+  │                           │───────────────────────>│                    │
+  │                           │  ← ok                  │                    │
+  │                           │                        │                    │
+  │                           │ SET url:xK3p9Qa <long_url> EX 3600          │
+  │                           │────────────────────────────────────────────>│
+  │                           │ ← ok                   │                    │
+  │                           │                        │                    │
+  │                           │ SET idempotency:abc123 <response> EX 86400  │
+  │                           │────────────────────────────────────────────>│
+  │                           │ ← ok                   │                    │
+  │                           │                        │                    │
+  │  HTTP 201                 │                        │                    │
+  │  { "short_url": "tiny.url/xK3p9Qa" }              │                    │
+  │<──────────────────────────│                        │                    │
+```
+
+**Step by step:**
+
+| Step | What happens | Why |
+|---|---|---|
+| 1 | Validate request (URL format, user auth, rate limit) | Reject bad requests before touching any storage |
+| 2 | Check Redis for `idempotency:abc123` | If found, return the cached response — the link was already created |
+| 3 | Pop `xK3p9Qa` from the Write Service's in-memory buffer | No DB call — this is why key pool pre-fetch matters |
+| 4 | `BEGIN` transaction on CockroachDB | Both inserts must succeed or both fail — no half-created links |
+| 5 | `INSERT INTO url_mappings` with the code and URL | Creates the actual mapping |
+| 6 | `INSERT INTO idempotency_log` with the response body | So if the client retries, we can return exactly the same response |
+| 7 | `COMMIT` — the link is now durable | After this point, the link exists even if the server crashes |
+| 8 | `SET url:xK3p9Qa <long_url> EX 3600` in Redis | Warm the cache so the first click doesn't miss |
+| 9 | `SET idempotency:abc123 <response> EX 86400` in Redis | 24-hour idempotency window |
+| 10 | Return 201 to client | Done |
+
+**What the resulting database row looks like:**
+
+```sql
+SELECT * FROM url_mappings WHERE short_code = 'xK3p9Qa';
+
+short_code  │ long_url                            │ user_id │ created_at           │ expires_at           │ is_deleted │ redirect_type
+────────────┼─────────────────────────────────────┼─────────┼──────────────────────┼──────────────────────┼────────────┼──────────────
+xK3p9Qa     │ https://example.com/very/long/path  │ 42      │ 2026-05-02 10:00:00  │ 2026-06-01 10:00:00  │ false      │ 302
+```
+
+---
+
+#### How a redirect uses this row
+
+When someone visits `tiny.url/xK3p9Qa`:
+
+```
+Redirect Service checks Redis:
+  GET url:xK3p9Qa  →  "https://example.com/very/long/path"  (cache hit)
+
+Builds and returns:
+  HTTP 302 Found
+  Location: https://example.com/very/long/path
+  Cache-Control: max-age=3600, s-maxage=3600
+
+(async, never blocking the redirect above)
+  Kafka.publish("url.clicks", { short_code: "xK3p9Qa", ts: now, country: "US" })
+```
+
+On a cache miss (1% of redirects), the query is simply:
+
+```sql
+SELECT long_url, expires_at, is_deleted, redirect_type
+FROM url_mappings
+WHERE short_code = 'xK3p9Qa';
+-- CockroachDB routes this to the single node that owns hash('xK3p9Qa')
+-- Result comes back in ~5ms from a read replica
+```
+
+---
+
+#### Custom aliases — how they differ from auto-generated codes
+
+When a user requests `/my-brand` instead of a random code:
+
+1. No code is claimed from `key_pool` — the user's alias is the code
+2. Write Service does `INSERT INTO url_mappings (short_code='my-brand', ...)` with an explicit unique constraint check
+3. If `my-brand` already exists: return **409 Conflict** — "this alias is already taken"
+4. Custom codes are never placed back into `key_pool` — they stay in `url_mappings` forever (even after deletion, `is_deleted=true` prevents reuse)
+
+**Risk:** a user could claim `xK3p9Qa` as a custom alias, matching a pre-generated pool code. The unique constraint on `url_mappings.short_code` catches this — the pool code's eventual INSERT would fail. The key generator handles this by generating codes, then checking they don't exist in `url_mappings` before adding to `key_pool`.
 
 **Monitoring:** Alert when the pool drops below 1 million codes. The background generator runs continuously and keeps it topped up.
 
