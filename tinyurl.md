@@ -438,26 +438,197 @@ We do **not** shard by `user_id`, even though it would make "list all my links" 
 
 ### Deep Dive 1: How do we generate unique short codes at 6,000/sec?
 
-#### The options
+The core challenge: every short link needs a unique 7-character code. A 7-character Base62 code (a–z, A–Z, 0–9) has 62^7 = **3.5 trillion** possible values — plenty of room. The problem isn't the key space, it's handing out codes to 6,000 simultaneous requests per second without any server waiting on another.
 
-**Option A: Hash the URL**
-Take the long URL, run it through MD5, take the first 7 characters.
+---
 
-Problem: math. With 100 million links, the probability of two URLs getting the same 7-character code is essentially 100% (birthday paradox — the same reason two people in a group of 23 share a birthday more often than you'd expect). You'd need complex collision-handling logic on the critical write path.
+#### Option A: Hash the URL
 
-**Option B: Global counter**
-Keep a counter somewhere (database or Redis). Each new link gets the next number, encoded as Base62.
+**How it works, step by step:**
 
-Problem: the counter is a single point of failure and a throughput limit. A single Redis node maxes out at ~100,000 operations per second and if it goes down, link creation stops entirely.
+1. User POSTs `https://example.com/very/long/path`
+2. Server runs: `MD5("https://example.com/very/long/path")` → produces a 128-bit hex string like `a9993e364706816aba3e25717850c26c`
+3. Take the first 7 characters: `a9993e3`
+4. Convert those hex characters to Base62 (a–z, A–Z, 0–9) to make the code more compact
+5. Try to `INSERT INTO url_mappings (short_code='a9993e3', long_url=...)` 
+6. If it succeeds → return the code
+7. If it fails (collision) → try the next 7 characters of the hash, retry the INSERT
 
-**Option C: Pre-generated key pool ← chosen**
+```
+"https://example.com/path"
+         │
+         ▼
+    MD5 hash (128 bits)
+    a9993e364706816aba3e25717850c26c
+         │
+         ▼  take first 7 chars
+    a9993e3  ──── INSERT attempt ──→  success? return "a9993e3"
+                                           │
+                                      collision? try "9993e36"
+                                           │
+                                      collision? try "993e364"
+                                           │ ... keep shifting
+```
 
-Generate millions of random codes offline (background job, no rush). Store them in a `key_pool` table. When a link is created, claim one code from the pool atomically.
+**The collision math (why this breaks):**
 
-**Why this works:**
-- Codes are generated offline with guaranteed uniqueness — no collision risk
-- Claiming a code from the pool is a simple database delete — fast and reliable
-- No single bottleneck: each Write Service server pre-fetches 1,000 codes from the pool into local memory at startup, eliminating database calls on the hot path
+> The **birthday paradox**: if you put enough people in a room, two will share a birthday surprisingly quickly. Same logic applies to short codes.
+
+Probability of at least one collision after `n` codes with keyspace `k`:
+
+```
+k = 62^7 = 3,521,614,606,208 possible codes
+n = 100,000,000 links (100M)
+
+P(collision) ≈ 1 - e^(-n²/2k)
+             ≈ 1 - e^(-(10^16)/(7×10^12))
+             ≈ 1 - e^(-1428)
+             ≈ 100%
+```
+
+With 100 million links, collisions are **mathematically certain**. Around every 3.5 million links you insert, you should expect one collision.
+
+**The real problem:** collision handling adds a retry on the write path — a second `SELECT` to check if the code exists, then a second `INSERT`. Under 6,000/sec, some requests will collide on the retry too (hash collision on a 7-char shifted window). You end up with cascading retries, unpredictable latency, and complex code on the hottest path in your system.
+
+**Verdict: works at 10,000 links. Unreliable at 100 million.**
+
+---
+
+#### Option B: Global counter
+
+**How it works, step by step:**
+
+1. Every new link gets the next integer: 1, 2, 3, 4, ...
+2. Convert that integer to Base62 — this is what makes it short:
+   - Integer 1 → `"1"` (1 character)
+   - Integer 1,000,000 → `"4c92"` (4 characters)
+   - Integer 3,521,614,606,207 → `"zzzzzzzz"` (7 characters)
+3. Store that Base62 string as the short code
+
+```
+Counter: 57,832,901
+         │
+         ▼
+   Base62 encode
+   57832901 ÷ 62 = 932788 r 25  → 'p'
+   932788   ÷ 62 = 15044   r 40  → 'O'
+   15044    ÷ 62 = 242     r 40  → 'O'
+   242      ÷ 62 = 3       r 56  → '4'
+   3        ÷ 62 = 0       r 3   → '3'
+         │
+         ▼
+   short code: "34OOp"   ← guaranteed unique, no collision possible
+```
+
+**The single-node problem:**
+
+The counter must be atomic — two servers can't both get "next = 57832901" at the same time or they'd produce duplicate codes. So the counter lives in one place:
+
+```
+Server A ──┐
+Server B ──┼──► Redis INCR counter ──► "here's your unique number"
+Server C ──┘
+Server D ──┘
+```
+
+A single Redis node handles ~100,000 INCR operations per second. At 6,000 link creations/sec we're far under that limit — BUT:
+
+- **Single point of failure**: Redis goes down → all link creation stops. Zero writes possible.
+- **Predictable codes**: codes increment sequentially (`abc1`, `abc2`, `abc3`...). Anyone can enumerate all your links by just iterating the counter.
+- **Hotspot**: all 6,000 writes/sec funnel through one node. Any operational issue (network blip, memory pressure, reboot) blocks everyone.
+
+**Mitigation attempt: range allocation.** Instead of one global INCR, each Write Service server grabs a range from the counter (e.g. "you own 1,000,000 to 1,001,000"). Servers work through their range locally, grab the next range when done. This reduces counter contention by 1,000x — but the counter is still a single point of failure.
+
+```
+Write Service A gets range: 1,000,000 → 1,001,000  (works locally until exhausted)
+Write Service B gets range: 1,001,000 → 1,002,000
+Write Service C gets range: 1,002,000 → 1,003,000
+         ...all still depend on one counter for range allocation
+```
+
+**Verdict: works at medium scale. Fragile; predictable codes are a security risk.**
+
+---
+
+#### Option C: Pre-generated key pool ← chosen
+
+**Core idea:** decouple code generation from code assignment. Generate millions of random, guaranteed-unique codes in a background job (offline, no time pressure). Store them in a `key_pool` table. When a link is created, simply claim a code from the pool. No hashing, no collision risk, no centralized counter.
+
+**How it works, step by step:**
+
+**Phase 1 — background key generation (runs continuously, never on the request path):**
+
+```
+Background job (runs every minute):
+  1. Generate 100,000 random 7-char Base62 strings
+  2. INSERT them into key_pool
+  3. ON CONFLICT DO NOTHING  ← handles the rare accidental duplicate
+  4. Pool stays at ~10 million available codes at all times
+```
+
+```sql
+INSERT INTO key_pool (short_code, created_at)
+SELECT
+  -- random Base62: take 7 chars from an md5 of a random number
+  substr(md5(random()::text), 1, 7),
+  NOW()
+FROM generate_series(1, 100000)
+ON CONFLICT DO NOTHING;
+```
+
+**Phase 2 — server startup (each Write Service pod, once):**
+
+```sql
+-- Claim 1,000 codes exclusively — SKIP LOCKED means two pods
+-- running this simultaneously will get DIFFERENT rows, never the same one
+DELETE FROM key_pool
+WHERE short_code IN (
+  SELECT short_code FROM key_pool
+  LIMIT 1000
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING short_code;
+-- → returns ['xK3p9Qa', 'mB7tR2n', 'pQ1zW4c', ...]
+```
+
+The pod stores these 1,000 codes in a local in-memory list. It never asks the database for a code again unless the buffer drops below 100 (at which point it refills asynchronously in a background thread).
+
+**Phase 3 — link creation (the request path, no DB call for the code):**
+
+```
+User POSTs long URL
+        │
+        ▼
+Write Service pops 'xK3p9Qa' from its in-memory list
+        │
+        ▼
+INSERT INTO url_mappings (short_code='xK3p9Qa', long_url='https://...')
+        │
+        ▼
+Return 'https://tiny.url/xK3p9Qa' to user
+```
+
+**Why `FOR UPDATE SKIP LOCKED` is the key:**
+
+Without it, two pods requesting codes simultaneously would both lock the same rows and one would have to wait. `SKIP LOCKED` tells the database: "if a row is already locked by someone else, skip it and give me the next available one." The result: two pods run the same query simultaneously and get completely different sets of codes — zero contention, zero waiting.
+
+```
+Pod A: SELECT ... FOR UPDATE SKIP LOCKED  →  gets codes 1–1000
+Pod B: SELECT ... FOR UPDATE SKIP LOCKED  →  gets codes 1001–2000  (skipped A's locked rows)
+Pod C: SELECT ... FOR UPDATE SKIP LOCKED  →  gets codes 2001–3000
+         No pod waits. All run concurrently.
+```
+
+**Comparison table:**
+
+| Property | Hash the URL | Global counter | Pre-generated key pool |
+|---|---|---|---|
+| Collision risk | Certain at 100M links | None | None |
+| Bottleneck | None (but retries add up) | Single counter node | None — codes live in pod memory |
+| Failure mode | Cascading retries on hot path | Counter down = all writes stop | Pool runs dry = ~10min warning before writes stop |
+| Code predictability | Deterministic (same URL = same code) | Sequential (enumerable) | Random (non-guessable) |
+| Complexity | Collision retry logic needed | Simple, then range allocation | Background generator + pre-fetch |
+| Works at 6K writes/sec | Unreliably | Yes, with range allocation | Yes, easily |
 
 #### The exact mechanism — key pool claim
 
