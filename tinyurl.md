@@ -927,3 +927,597 @@ Good answer: it's not just one delete. Database: null out the `long_url` field (
 - Observability / alerting specifics
 - Deployment strategy (mention canary deploys, skip the rollback thresholds)
 - Security details beyond "rate limiting and JWT auth"
+
+---
+
+## 11. Further Deep Dives
+
+These come up in FAANG interviews as follow-up questions after you've covered the core design. Each one has a concrete problem, a naive approach that fails, and the production solution.
+
+---
+
+### Further Dive A: Viral spike — one link goes from 0 to 500K clicks/sec in 30 seconds
+
+**The problem in plain English:** A celebrity posts your short link. Within 30 seconds, hundreds of thousands of people click it simultaneously. Your system has never seen this link before — no CDN cache, no Redis entry, nothing. What happens?
+
+**What actually breaks — the first 30 seconds:**
+
+```
+t=0s:   link created, nobody has clicked it yet
+t=0s:   celebrity posts it to 50M followers
+
+t=1s:   500 people click simultaneously
+         → all 500 miss CDN (not cached yet)
+         → all 500 hit Redirect Service
+         → all 500 miss Redis (not cached yet)
+         → all 500 hit CockroachDB read replica
+
+t=2s:   2,000 more clicks
+         → CDN has cached it now (from t=1 misses)
+         → CDN serves 75% = 1,500 from CDN
+         → 500 still hit origin
+
+t=30s:  500,000 clicks/sec
+         → CDN serving ~375,000/sec (cache warm now)
+         → 125,000/sec hitting origin
+```
+
+The window between t=0 and t=2 is the risk. Let's quantify:
+
+```
+500 simultaneous DB hits (t=1s): read replica handles ~50,000 reads/sec → fine
+2,000 simultaneous DB hits (t=2s): still fine
+Peak origin load (125,000/sec): 30 servers × 10,000/sec capacity = 300,000/sec capacity → fine
+```
+
+For TinyURL-scale, the math works out — the CDN warms fast enough. But the scenario gets genuinely dangerous in one edge case: the **thundering herd on cache miss**.
+
+**The thundering herd:**
+
+Imagine the CDN cache for `xK3p9Qa` expires at exactly 12:00:00. Ten thousand people click it at 12:00:00.001. All 10,000 get a CDN miss. Cloudflare collapses them using "request coalescing" — only 1 request per PoP (200 PoPs) goes to origin. So origin sees 200 requests, not 10,000. That's fine.
+
+But what if 200 PoPs all miss Redis simultaneously? 200 DB reads at once. Still fine.
+
+The problem is **Redis hot shard**. Redis cluster divides keys across 6 shards using consistent hashing. `hash('xK3p9Qa')` routes to exactly one shard. If that link is getting 100,000 Redis hits/sec, all 100,000 go to one Redis shard. A Redis node handles ~100,000 ops/sec — you've just maxed it out with a single key.
+
+**The fix: local in-process cache as primary for hot keys**
+
+Each Redirect Service pod already keeps a 10,000-entry local LRU cache (§7 Deep Dive 2, Layer 2). When a link is hot, every pod has it locally after the first hit. Redis sees at most `num_pods` requests for that key (30 pods × 1 miss each = 30 Redis requests), not 100,000.
+
+```
+100,000 redirects/sec for 'xK3p9Qa'
+Across 30 pods = ~3,333 redirects/sec per pod
+Each pod caches locally after first hit
+→ Redis sees 30 requests (one miss per pod), then zero
+→ DB sees near zero
+```
+
+**FAANG interview angle:** At Google/Meta scale with 10,000 pods, even one miss per pod = 10,000 Redis requests. The fix is to detect "this key is hot" and actively push it to all pods' in-process caches via pub/sub, rather than waiting for each pod to discover it organically.
+
+---
+
+### Further Dive B: Link expiry — how do you delete 100M expired links efficiently?
+
+**The problem in plain English:** Links have expiry times. Every day, millions of links expire. When someone clicks an expired link, they should get a "this link has expired" page, not a redirect. How do you handle this efficiently?
+
+**Naive approach — check on every redirect:**
+
+```sql
+SELECT long_url, expires_at FROM url_mappings WHERE short_code = 'xK3p9Qa';
+-- Then in application code:
+if (expires_at < NOW()) return 410 Gone;
+```
+
+This works but means every redirect checks `expires_at`. Fine for the DB, but what about Redis? The Redis entry has no concept of "check if this URL is expired" — it just returns the cached `long_url`. So either:
+- You store `expires_at` alongside `long_url` in Redis and check it on every cache hit (adds logic to the hot path)
+- Or you don't cache expired links and rely on Redis TTL matching the link's TTL
+
+**The clean solution: align Redis TTL with link expiry**
+
+When you write to Redis, set the TTL to match the link's remaining lifetime:
+
+```
+Link expires_at = 2026-06-01 10:00:00
+Current time   = 2026-05-02 10:00:00
+Remaining TTL  = 2,592,000 seconds (30 days)
+
+SET url:xK3p9Qa "https://example.com/..." EX 2592000
+```
+
+When the link expires, Redis automatically evicts it. The next click gets a cache miss, hits the DB, finds `expires_at < NOW()`, returns 410. Simple, no extra logic on the hot path.
+
+**The hard part — garbage collecting the DB rows:**
+
+You have 182 billion rows over 5 years. Every day, ~100M expire. If you run `DELETE FROM url_mappings WHERE expires_at < NOW()` it will:
+- Lock a massive portion of the table
+- Generate a huge write amplification (CockroachDB must tombstone each row, then compact)
+- Run for hours
+
+**The production approach: time-partitioned table + drop partition**
+
+Instead of deleting rows, partition the `url_mappings` table by month of `created_at`. When an entire month's partition is past its maximum possible expiry date, drop the entire partition:
+
+```sql
+-- Instead of DELETE, create table with partitions:
+CREATE TABLE url_mappings_2026_01 PARTITION OF url_mappings
+  FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+
+-- When all links from Jan 2026 are guaranteed expired (e.g., max TTL is 1 year):
+DROP TABLE url_mappings_2026_01;  -- instant — no row-by-row deletion
+```
+
+Dropping a partition is O(1) — a metadata operation, not a row scan. This is orders of magnitude faster than `DELETE WHERE expires_at < ...`.
+
+**For rows within a live partition that expire early:**
+
+A small background job runs nightly:
+```sql
+DELETE FROM url_mappings
+WHERE expires_at < NOW() - INTERVAL '1 day'  -- 1 day buffer for cache alignment
+  AND expires_at > created_at  -- only explicitly-set TTL rows
+LIMIT 10000;  -- batch to avoid locking
+-- Run this in a loop until 0 rows affected
+```
+
+The `LIMIT 10000` is critical — it prevents one massive transaction, keeps lock duration short, and lets the DB breathe between batches.
+
+---
+
+### Further Dive C: Click analytics pipeline — how does Kafka → ClickHouse actually work?
+
+**The problem in plain English:** Every redirect generates a click event: which link, when, from which country, from which referrer. We want to be able to answer "how many clicks did link X get this week, by country?" without that analytics work ever slowing down a redirect.
+
+**Why Kafka is in the middle:**
+
+The Redirect Service publishes events to Kafka instead of writing directly to ClickHouse because:
+- Redirects must be fast (~1ms). Writing to ClickHouse inline could add 5–50ms.
+- ClickHouse prefers large batch inserts (thousands of rows at once). One-row inserts are very inefficient for columnar stores.
+- Kafka acts as a buffer: 1,160,000 events/sec flow in, ClickHouse reads them in batches of 100,000 at a time.
+
+**The flow:**
+
+```
+Redirect Service
+      │
+      │  fire-and-forget (acks=0, never blocks the redirect)
+      ▼
+Kafka topic: "url.clicks"
+  - 256 partitions (parallelism)
+  - replication factor 3
+  - retention: 7 days (replay window if ClickHouse falls behind)
+      │
+      │  ClickHouse Kafka table engine reads in batches
+      ▼
+ClickHouse "clicks" table
+  - columnar storage — reads a single column (e.g. country) without touching others
+  - partitioned by month (PARTITION BY toYYYYMM(ts))
+  - sorted by (short_code, ts) — makes time-range queries per link extremely fast
+```
+
+**The ClickHouse schema:**
+
+```sql
+CREATE TABLE clicks (
+    short_code  String,
+    ts          DateTime,
+    country     LowCardinality(String),  -- LowCardinality = dictionary encoding, much smaller
+    referrer    String,
+    user_agent  String
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(ts)
+ORDER BY (short_code, ts);   -- queries like "clicks for xK3p9Qa last 7 days" are instant
+```
+
+**How a query runs:**
+
+```sql
+-- "How many clicks did xK3p9Qa get per country this week?"
+SELECT country, count() AS clicks
+FROM clicks
+WHERE short_code = 'xK3p9Qa'
+  AND ts >= now() - INTERVAL 7 DAY
+GROUP BY country
+ORDER BY clicks DESC;
+
+-- ClickHouse:
+-- 1. Jumps to the partition containing the last 7 days (skips all older data)
+-- 2. Reads only the short_code, ts, and country columns (skips referrer, user_agent)
+-- 3. Returns in ~50ms even over billions of rows
+```
+
+**Why ClickHouse and not PostgreSQL for analytics?**
+
+PostgreSQL stores rows: `[short_code, ts, country, referrer, user_agent]` all together. Reading `country` for 1 billion rows means reading all 5 columns. ClickHouse stores columns: all `country` values together, all `ts` values together. Reading `country` for 1 billion rows reads only that one column — 5–10x less I/O.
+
+---
+
+### Further Dive D: GDPR erasure — deleting a user's data across 5 systems
+
+**The problem in plain English:** A user says "delete all my data." Under GDPR, you have 30 days to comply. But the user's URLs are stored in 5 different places: the main database, Redis, the CDN, Kafka (event stream), and ClickHouse (analytics). You must remove PII from all of them.
+
+**Where PII lives:**
+
+| System | What's stored | PII risk |
+|---|---|---|
+| CockroachDB `url_mappings` | `long_url` (may contain tokens/personal info), `user_id` | High |
+| Redis | `url:xK3p9Qa → long_url` | High (same URL) |
+| CDN (Cloudflare) | Cached `Location: https://...` header | High |
+| Kafka `url.clicks` | `short_code`, `country`, `user_agent` | Low-medium (no URL, but linkable to user) |
+| ClickHouse `clicks` | Same as Kafka events | Low-medium |
+
+**The erasure sequence:**
+
+```
+User triggers deletion
+        │
+        ▼
+1. CockroachDB: UPDATE url_mappings
+   SET long_url = NULL, user_id = NULL
+   WHERE user_id = 42;
+   -- Keep the row! The short_code must stay so the code isn't reused.
+   -- Nulling long_url means future clicks get a 410 Gone response.
+        │
+        ▼
+2. Redis: DEL url:xK3p9Qa (for each of user 42's links)
+   -- Immediate. Next click misses cache, hits DB, gets NULL long_url → 410.
+        │
+        ▼
+3. CDN: POST https://api.cloudflare.com/zones/{id}/purge_cache
+   { "files": ["https://tiny.url/xK3p9Qa", ...] }
+   -- Takes ~500ms to propagate globally.
+   -- Any click in that window gets the cached old redirect.
+   -- Document this 500ms window in your privacy policy.
+        │
+        ▼
+4. ClickHouse: ALTER TABLE clicks DELETE WHERE short_code IN ('xK3p9Qa', ...)
+   -- Async mutation — ClickHouse marks rows for deletion, physically removes during next merge.
+   -- Takes minutes to hours. Acceptable — GDPR allows 30 days.
+        │
+        ▼
+5. Kafka: events already published cannot be deleted from the stream.
+   -- Solution: set a 7-day retention on the topic. After 7 days, old events are gone automatically.
+   -- OR: use Kafka's "delete by key" compaction (tombstone record) for event sourcing setups.
+        │
+        ▼
+6. Backups: document that PII may remain in encrypted backups for up to 90 days
+   (backup rotation period). These are inaccessible except for disaster recovery.
+   This is explicitly permitted by GDPR recital 65.
+        │
+        ▼
+7. Audit log: INSERT INTO gdpr_erasure_log (user_id, requested_at, completed_at, steps_completed)
+   -- Proof of compliance for regulators.
+```
+
+**Tracking completion — the erasure job:**
+
+```sql
+CREATE TABLE gdpr_erasure_log (
+    user_id          BIGINT,
+    requested_at     TIMESTAMP,
+    db_erased_at     TIMESTAMP,
+    redis_erased_at  TIMESTAMP,
+    cdn_purged_at    TIMESTAMP,
+    clickhouse_at    TIMESTAMP,
+    completed_at     TIMESTAMP   -- NULL until all steps done
+);
+```
+
+A background job monitors this table and retries any step that hasn't completed within its SLA:
+- DB: must complete in < 1 minute
+- Redis: must complete in < 1 minute
+- CDN: must complete in < 5 minutes
+- ClickHouse: must complete in < 24 hours
+- All steps: must complete within 30 days (GDPR deadline)
+
+---
+
+### Further Dive E: Rate limiting — stopping abuse without blocking real users
+
+**The problem in plain English:** Without rate limiting, a single user (or bot) could create millions of links per second, exhaust the key pool, fill the database, and take down the service for everyone. You need to limit how fast any one user or IP can make requests.
+
+**What to rate limit and where:**
+
+| What | Limit | Why |
+|---|---|---|
+| Link creation per authenticated user | 1,000/day, 10/sec burst | Prevent key pool exhaustion |
+| Link creation per IP (unauthenticated) | 10/hour | Stop anonymous abuse |
+| Redirects per IP | 1,000/sec | Stop redirect-based DDoS |
+| API key calls | Custom per customer | Enterprise clients have higher limits |
+
+Rate limiting must happen at the **API Gateway**, before the request reaches the Write Service — reject bad requests at the edge, before they touch any storage.
+
+**The algorithm: sliding window counter in Redis**
+
+A fixed window (e.g. "reset counter at midnight") is easily gamed — send 999 requests at 11:59pm and 999 more at 12:00am. A sliding window counts requests in the last N seconds regardless of clock boundaries.
+
+```
+For user_id=42, limit=10 requests per second:
+
+Key:  rate:{user_id}:{floor(ts/1000)}   (current 1-second bucket)
+Key:  rate:{user_id}:{floor(ts/1000)-1}  (previous 1-second bucket)
+
+Count = (prev_bucket_count × overlap_fraction) + current_bucket_count
+
+Where overlap_fraction = how much of the previous second is still in our window
+```
+
+In Redis (atomic Lua script, so read+write is one operation with no race condition):
+
+```lua
+-- Sliding window rate limit check
+local key_current = "rate:" .. user_id .. ":" .. math.floor(ts / 1000)
+local key_prev    = "rate:" .. user_id .. ":" .. (math.floor(ts / 1000) - 1)
+
+local current = tonumber(redis.call("GET", key_current) or 0)
+local prev    = tonumber(redis.call("GET", key_prev) or 0)
+
+-- How far into the current second are we? (0.0 to 1.0)
+local overlap = 1.0 - ((ts % 1000) / 1000)
+
+-- Weighted count across the sliding window
+local count = prev * overlap + current
+
+if count >= limit then
+    return 0  -- rejected
+end
+
+-- Increment current bucket, expire after 2 seconds
+redis.call("INCR", key_current)
+redis.call("EXPIRE", key_current, 2)
+return 1  -- allowed
+```
+
+**Response to the client when rate-limited:**
+
+```
+HTTP 429 Too Many Requests
+Retry-After: 1
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1746350401
+```
+
+**FAANG interview angle:** The interviewer will ask: "What if a user has 10,000 servers all making requests simultaneously — your per-IP limit doesn't help." The answer: rate limit by API key (authenticated), not just IP. For DDoS at the IP level, use the CDN/WAF (Cloudflare blocks it before it reaches your origin). Your Redis rate limiter is for per-user fairness, not volumetric DDoS protection.
+
+---
+
+### Further Dive F: Sharding, consistent hashing, and replication
+
+These topics come up in almost every FAANG system design interview. Interviewers ask about them because they reveal whether you understand *why* distributed systems are hard — not just *what* they do.
+
+---
+
+#### Why we need sharding at all
+
+A single PostgreSQL node can hold ~5TB of data comfortably. Our system needs 100TB. So we need at least 20 servers, each holding a slice of the data. **Sharding** is the strategy for deciding which server holds which row.
+
+```
+Without sharding:
+  All 100TB on one DB node → node maxes out storage and I/O
+
+With sharding (20 nodes):
+  Node 1: short codes starting hash 0–5%
+  Node 2: short codes starting hash 5–10%
+  ...
+  Node 20: short codes starting hash 95–100%
+```
+
+---
+
+#### Hash sharding — the naive approach and its problem
+
+The simplest rule: `server_number = hash(short_code) % num_shards`
+
+```
+hash('xK3p9Qa') = 2,847,291,034
+2,847,291,034 % 20 = 14   →  send this row to server 14
+```
+
+Every redirect: compute hash, send request to the right server. Fast, even distribution.
+
+**The problem: resharding.** When you add a 21st server, every code's server number changes (`% 21` gives different results than `% 20`). You have to move almost all your data to different servers. During this migration, the system either goes down or serves stale data.
+
+```
+Before (20 shards): 'xK3p9Qa' → server 14
+After  (21 shards): 'xK3p9Qa' → server 3   ← it moved!
+```
+
+With 100TB of data, that migration takes hours or days.
+
+---
+
+#### Consistent hashing — the production solution
+
+Instead of `hash(key) % N`, consistent hashing places both servers and keys on a virtual ring (values 0 to 2^32). A key is owned by the nearest server clockwise on the ring.
+
+```
+          Server A (position 100)
+               │
+        ───────┼──────────────────────
+       /        \
+  Key 'abc'      Key 'xyz' (position 450)
+  (position 80)      │
+      \         ─────┼────────────────
+       \             Server B (position 500)
+        \
+         Server C (position 700)
+```
+
+When you add a new server, only the keys between the new server and its predecessor move — roughly `1/N` of total data instead of almost all of it.
+
+```
+Add Server D at position 300:
+  Only keys from position 100 to 300 (previously owned by Server B) move to D.
+  Everything else stays put.
+  
+  Before: ~0% of data moves
+  After:  ~1/N of data moves (where N = number of servers)
+```
+
+**Virtual nodes** make distribution even more uniform. Instead of each physical server having one position on the ring, it has 150 positions. This prevents one physical server from accidentally owning a disproportionately large slice.
+
+CockroachDB implements consistent hashing internally (it calls them "ranges") — this is handled automatically. You don't implement it yourself; you just pick the right shard key.
+
+---
+
+#### Hot shard — when one code gets all the traffic
+
+With hash sharding, `hash('xK3p9Qa')` always maps to the same shard. If a viral link gets 500K clicks/sec, all 500K hits go to one shard. That shard becomes a bottleneck regardless of how many total shards you have.
+
+**Why it's less of a problem here than you'd think:**
+
+The four-layer cache (§7 Deep Dive 2) absorbs viral traffic before it ever reaches the DB. At 500K clicks/sec on one link:
+- 375K/sec served by CDN
+- 50K/sec served by pod local memory (30 pods × ~1,667/sec)
+- 74K/sec served by Redis
+- ~600/sec hit the DB
+
+600 reads/sec on one shard is trivial. The shard is only hot at the *cache* level — and the hot-key Redis fix (push to all pod memory via pub/sub) solves that.
+
+**When hot shard is a real problem:** write-heavy keys. If you had a counter that increments on every redirect (e.g. click count), all those writes would land on one shard. The fix: shard the counter across multiple keys (`clicks:xK3p9Qa:0`, `clicks:xK3p9Qa:1`, ...) and sum them on read.
+
+---
+
+#### Replication — why data lives on multiple nodes
+
+**Replication** means keeping identical copies of data on multiple servers. Two reasons:
+1. **Durability**: if one server's disk fails, the copies survive
+2. **Read scaling**: read requests can be spread across all copies
+
+**Synchronous vs asynchronous replication:**
+
+```
+SYNCHRONOUS:
+  Client writes → Primary → sends to Replica 1 → Replica 1 acknowledges
+                          → sends to Replica 2 → Replica 2 acknowledges
+                          → Primary commits → tells client "done"
+
+  ✅ Zero data loss: all copies are up-to-date before client gets confirmation
+  ❌ Higher latency: write waits for slowest replica
+  ❌ Write unavailable if a replica is down (or: you skip it and lose the guarantee)
+
+
+ASYNCHRONOUS:
+  Client writes → Primary → commits locally → tells client "done"
+                          → (background) replicates to replicas
+
+  ✅ Lower latency: client doesn't wait for replicas
+  ❌ Data loss window: if primary crashes before replication completes, that write is lost
+  ❌ Replicas may be slightly behind (replica lag)
+```
+
+**What CockroachDB does: Raft quorum (semi-synchronous)**
+
+CockroachDB doesn't do fully synchronous (wait for all replicas) or fully asynchronous (don't wait for any). It uses **Raft consensus** — a write is committed once a *majority* (quorum) of replicas acknowledge it.
+
+```
+3 replicas: quorum = 2
+  Primary writes → Replica 1 acks → commit (Replica 2 catches up later)
+  
+  ✅ No data loss: at least 2 of 3 always have the write before commit
+  ✅ Tolerates 1 replica down: 2 remaining = still quorum
+  ✅ Reasonable latency: only wait for the fastest replica to respond
+
+3 replicas across 3 AZs:
+  AZ-1 [Primary] ──────────────────────────────────┐
+  AZ-2 [Replica 1] — acks write — quorum reached ──┘ commit happens here
+  AZ-3 [Replica 2] — catches up asynchronously
+  
+  If AZ-3 goes down entirely: AZ-1 + AZ-2 = still quorum → no downtime, no data loss
+  If AZ-1 (primary) goes down: Raft elects new leader from AZ-2 or AZ-3 in ~5 seconds
+```
+
+**Why 3 replicas specifically?**
+
+With 2 replicas, losing 1 = only 1 left = no quorum = writes stop. With 3, losing 1 leaves 2 = quorum maintained. With 5, losing 2 leaves 3 = quorum maintained. The general rule: `(N-1)/2` failures tolerated for N replicas.
+
+In practice: 3 replicas across 3 AZs handles any single AZ failure. 5 replicas for systems that must survive 2 simultaneous AZ failures.
+
+---
+
+#### Read replicas and replica lag
+
+In CockroachDB (and PostgreSQL), you can configure some replicas as **read replicas** — they receive writes from the primary but only serve reads to application code. This spreads read load across multiple nodes.
+
+**The lag problem:** async replication means read replicas may be 10–200ms behind the primary. A user creates a link, then immediately tries to click it — if the redirect goes to a read replica that hasn't received the write yet, they get a 404.
+
+**How this system handles it:**
+
+1. **Write path caches immediately in Redis.** After INSERT succeeds, the Write Service puts the new link in Redis with EX 3600. The redirect path checks Redis first. So the first redirect hits Redis (fresh), not the DB replica.
+
+2. **Eventual consistency is documented as acceptable.** In the non-functional requirements: "A new link may not be visible globally for ~1 second." That 1 second covers both replica lag and cross-region propagation.
+
+3. **For the 1% of redirects that miss Redis and hit the DB:** if the read replica hasn't caught up, the redirect gets a 404. The user refreshes. By then, the replica has caught up. This is a real edge case — the 200ms lag window — but acceptable for a URL shortener.
+
+---
+
+#### Partitioning vs sharding — the distinction
+
+These terms are often used interchangeably but mean slightly different things:
+
+| | Partitioning | Sharding |
+|---|---|---|
+| Where | Within a single DB server | Across multiple DB servers |
+| Purpose | Faster queries (pruning), manageability | Horizontal scale beyond one server |
+| Example | Table split into monthly partitions on one server | Table split across 20 servers by hash of short_code |
+| Can combine? | Yes — CockroachDB shards across servers AND partitions within ranges |
+
+In this system we use both:
+- **Sharding** by `hash(short_code)` across 9 CockroachDB nodes (horizontal scale)
+- **Partitioning** by `created_at` month within each node (for efficient expiry cleanup — see Further Dive B)
+
+---
+
+### Further Dive G: Other topics routinely probed but often missed
+
+**Connection pooling:**
+Your 30 Redirect Service pods each need to talk to CockroachDB. If each pod opens 100 connections, that's 3,000 simultaneous DB connections. PostgreSQL/CockroachDB struggles above ~1,000 connections (each has overhead). Fix: PgBouncer or CockroachDB's built-in connection pool sits between app and DB, multiplexing 3,000 app connections onto 100 actual DB connections.
+
+**Index design:**
+`url_mappings` primary key is `short_code` — lookup by short_code is O(log n) via B-tree index automatically. We do NOT need a secondary index on `user_id` for the redirect path. We would add one only if "list all links for a user" is a product requirement — and then it's a separate query with different SLA (500ms acceptable, not 50ms).
+
+```sql
+-- Only add this if you need "list my links":
+CREATE INDEX idx_url_mappings_user_id ON url_mappings(user_id, created_at DESC);
+-- Composite: user_id first (equality filter), created_at second (sort for pagination)
+```
+
+**Circuit breakers:**
+When CockroachDB is slow (not down, just slow — high latency), the Redirect Service waits for each query. 1,000 concurrent requests × 2s timeout each = 2,000 threads blocked. The service runs out of threads and stops responding entirely. Circuit breaker pattern: after 10 consecutive failures or >50% error rate in a 10-second window, "open" the circuit — fail immediately without trying the DB for 30 seconds. During this time, serve only cached responses (from Redis and local memory). Re-try after 30 seconds ("half-open" state).
+
+**Timeout budget (per hop):**
+```
+Total p99 budget: 50ms
+  CDN overhead:        ~5ms
+  Load balancer:       ~1ms
+  API Gateway:         ~2ms
+  Redis lookup:        ~2ms
+  DB lookup (if miss): ~10ms
+  Response building:   ~2ms
+  Network return:      ~5ms
+  Buffer:              ~23ms
+  ─────────────────────────
+  Total:               ~50ms
+```
+Each hop needs a timeout smaller than its budget. If Redis takes >5ms, abort and fall through to DB rather than waiting 30 seconds.
+
+**Observability (the 4 golden signals):**
+Every service should alert on: latency (p50, p99), traffic (requests/sec), errors (5xx rate), saturation (CPU, memory, connection pool usage). For TinyURL, the most important dashboards: redirect p99 latency by layer (CDN vs Redis vs DB), cache hit rate per layer, key pool remaining count, Kafka consumer lag (if this grows, analytics is falling behind).
+
+---
+
+### What these topics signal in a FAANG interview
+
+At L4, you're expected to cover the core design (§1–§9).
+
+At L5, you're expected to handle follow-up questions on at least 2–3 of these deeper topics when the interviewer probes.
+
+At L6, you **proactively bring up** 1–2 of these as "here's what I'd also want to make sure we handle" without being asked — and you have concrete solutions, not vague gestures. The specific ones most likely to impress:
+
+| Topic | Why it signals seniority |
+|---|---|
+| Viral spike + Redis hot shard | Shows you think about failure modes at the data layer, not just the service layer |
+| GDPR erasure cascade | Shows you think about operational and legal correctness, not just correctness at p0 |
+| Rate limiting with sliding window | Shows you know the difference between a naive fixed-window and a production-grade algorithm |
+| Partition-drop for expiry | Shows you know DB internals — most candidates suggest a cron DELETE and don't know why that's dangerous |
